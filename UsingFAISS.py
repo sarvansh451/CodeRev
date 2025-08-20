@@ -5,7 +5,7 @@ import json
 import re
 import pandas as pd
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -19,6 +19,9 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 # ✅ New import
 import trafilatura  
 from json import JSONEncoder
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+
+import torch
 
 # Ensure NLTK data is available
 nltk.download('vader_lexicon', quiet=True)
@@ -132,6 +135,70 @@ class VectorDB:
                 })
                 for k, v in data["items"].items()
             }
+
+    def get_relevant_context(self, query: str, k: int = 3) -> Tuple[List[NewsItem], List[float]]:
+        """Get relevant articles and their distances for RAG"""
+        query_vector = self.encode_text(query)
+        distances, indices = self.index.search(query_vector.reshape(1, -1), k)
+        results = []
+        for idx, distance in zip(indices[0], distances[0]):
+            if idx != -1 and idx in self.stored_items:
+                results.append(self.stored_items[idx])
+        return results, distances[0]
+
+
+class RAGEngine:
+    def __init__(self, vector_db: VectorDB):
+        self.vector_db = vector_db
+        self.model_name = "t5-small"
+        try:
+            self.tokenizer = T5Tokenizer.from_pretrained(self.model_name)
+            self.model = T5ForConditionalGeneration.from_pretrained(
+                self.model_name,
+                device_map='auto' if torch.cuda.is_available() else None,
+                torch_dtype=torch.float32
+            )
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.model.to(self.device)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+
+    def generate_response(self, query: str, max_length: int = 256) -> str:
+        try:
+            # Get relevant articles
+            relevant_items, distances = self.vector_db.get_relevant_context(query, k=2)  # Reduced from 3 to 2
+            
+            # Prepare context more concisely
+            context = " ".join([
+                f"{item.title}. {item.article_text[:200]}..." 
+                for item in relevant_items
+            ])
+            
+            # More focused prompt
+            prompt = f"summarize in 2-3 sentences: {query}\n\nContext: {context}"
+
+            # Generate response with tighter constraints
+            inputs = self.tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            outputs = self.model.generate(
+                **inputs,
+                max_length=max_length,
+                min_length=50,  # Ensure minimum length
+                num_return_sequences=1,
+                temperature=0.5,  # Reduced from 0.7 for more focused output
+                do_sample=True,
+                no_repeat_ngram_size=3,
+                length_penalty=1.5,  # Prefer shorter responses
+                early_stopping=True
+            )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return response.strip()
+        except Exception as e:
+            print(f"Error generating response: {e}")
+            return f"Error generating response: {str(e)}"
 
 
 def build_google_news_rss_url(q: str, hl: str = "en-US", gl: str = "US") -> str:
@@ -308,9 +375,9 @@ def to_dataframe(news_items: List[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-if __name__ == "__main__":  # ✅ Fixed: was _name == "main"
-    parser = argparse.ArgumentParser(description="Scrape Google News with real article content")
-    group = parser.add_mutually_exclusive_group(required=True)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Scrape Google News with real article content and RAG")
+    group = parser.add_mutually_exclusive_group()  # Remove required=True
     group.add_argument("--q", help="Search query for scraping news")
     group.add_argument("--search", help="Search query in existing vector database")
     
@@ -321,11 +388,35 @@ if __name__ == "__main__":  # ✅ Fixed: was _name == "main"
     parser.add_argument("--output", default="output.json", help="Output file (CSV or JSON)")
     parser.add_argument("--format", choices=["csv", "json"], default="json", help="Output format")
     parser.add_argument("--vector-db", default="news_vectors", help="Vector database file path")
+    parser.add_argument("--rag-query", help="Query for RAG-based answer generation")
     args = parser.parse_args()
 
     vector_db = VectorDB()
     
-    if args.search:
+    if args.rag_query:
+        try:
+            vector_db.load(args.vector_db)
+            if not args.q and not args.search:
+                # If no search query is provided, use the rag_query as search query
+                args.search = args.rag_query
+            
+            if args.q:
+                # If scraping new articles
+                results = scrape_google_news(
+                    args.q, args.hl, args.gl, args.max, 
+                    args.workers, vector_db=vector_db
+                )
+                vector_db.save(args.vector_db)
+            
+            # Generate RAG response
+            rag_engine = RAGEngine(vector_db)
+            response = rag_engine.generate_response(args.rag_query)
+            print(f"\nQuestion: {args.rag_query}")
+            print(f"\nAnswer: {response}\n")
+        except FileNotFoundError:
+            print("No vector database found. Please run with --q first to scrape some articles.")
+            print("Example: python Hackathon.py --q 'artificial intelligence' --max 10")
+    elif args.search:
         try:
             vector_db.load(args.vector_db)
             results = vector_db.search(args.search)
